@@ -1,0 +1,1 @@
+python3 learning_decoder.py --mode infer --image /root/autodl-tmp/privacy/results/test.jpg --layers 1,2,3,4,8

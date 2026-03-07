@@ -3,10 +3,10 @@ cd "$(dirname "$0")/.." || exit 1
 python DP.py \
     --ckpt vit_cifar100_best.pt \
     --stages 1,2,3,4,8,12 \
-    --laplace-scale 0.02 \
+    --laplace-scale 2 \
     --run-acc \
     --run-inversion \
-    --image test.jpg \
+    --image /root/autodl-tmp/privacy/results/test.jpg \
     --output-dir results/dp_laplace \
     --inv-steps 1500 \
     --inv-lr 0.005 \
@@ -14,4 +14,4 @@ python DP.py \
     --inv-l2 1e-6 \
     --inv-match all \
     --inv-init gray \
-    --inv-restarts 3
+    --inv-restarts 1

@@ -151,22 +151,22 @@ def run_inversion_with_dp(
         clean_feat = clean_feats[layer]
         noisy_feat = clean_feat + laplace_noise_like(clean_feat, laplace_scale)
 
-        print(f"\n[Inversion] layer={layer} clean feature")
-        recon_clean, loss_clean = feature_inversion(
-            backbone=model,
-            target_feat=clean_feat,
-            block_idx=layer,
-            device=device,
-            num_steps=inv_steps,
-            lr=inv_lr,
-            feat_weight=inv_feat_weight,
-            cos_weight=inv_cos,
-            tv_weight=inv_tv,
-            l2_weight=inv_l2,
-            match=inv_match,
-            init=inv_init,
-            restarts=inv_restarts,
-        )
+        # print(f"\n[Inversion] layer={layer} clean feature")
+        # recon_clean, loss_clean = feature_inversion(
+        #     backbone=model,
+        #     target_feat=clean_feat,
+        #     block_idx=layer,
+        #     device=device,
+        #     num_steps=inv_steps,
+        #     lr=inv_lr,
+        #     feat_weight=inv_feat_weight,
+        #     cos_weight=inv_cos,
+        #     tv_weight=inv_tv,
+        #     l2_weight=inv_l2,
+        #     match=inv_match,
+        #     init=inv_init,
+        #     restarts=inv_restarts,
+        # )
 
         print(f"[Inversion] layer={layer} noisy feature (Laplace)")
         recon_noisy, loss_noisy = feature_inversion(
@@ -184,27 +184,16 @@ def run_inversion_with_dp(
             init=inv_init,
             restarts=inv_restarts,
         )
-
-        recon_clean = recon_clean.clamp(0, 1)
-        recon_noisy = recon_noisy.clamp(0, 1)
-        to_pil(recon_clean.squeeze(0).cpu()).save(output_dir / f"layer{layer}_clean.jpg")
         to_pil(recon_noisy.squeeze(0).cpu()).save(output_dir / f"layer{layer}_laplace.jpg")
 
         row = {
             "layer": layer,
             "laplace_scale": laplace_scale,
-            "inv_loss_clean": float(loss_clean),
             "inv_loss_laplace": float(loss_noisy),
-            "mse_clean": float(F.mse_loss(recon_clean, x01).item()),
             "mse_laplace": float(F.mse_loss(recon_noisy, x01).item()),
-            "psnr_clean": float(psnr(recon_clean, x01)),
             "psnr_laplace": float(psnr(recon_noisy, x01)),
         }
         rows.append(row)
-        print(
-            f"  layer={layer} | PSNR clean={row['psnr_clean']:.2f}, "
-            f"laplace={row['psnr_laplace']:.2f}"
-        )
     return rows
 
 

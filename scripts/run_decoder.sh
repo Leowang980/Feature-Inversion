@@ -1,0 +1,1 @@
+python learning_decoder.py --mode both
