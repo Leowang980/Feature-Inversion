@@ -3,7 +3,8 @@ Feature inversion from Qwen VL vision encoder hidden states.
 
 Workflow:
 1) load Qwen VL model + processor from transformers
-2) extract target visual hidden states at selected vision layers
+2) extract target visual hidden states at selected indices in output_hidden_states
+   （与 HF Qwen3_VL / Qwen3_5 ViT 的 capture_outputs 约定一致：0=stem，1..N=各 block 后）
 3) optimize an image in [0,1] so its visual features match target features
 """
 from __future__ import annotations
@@ -22,6 +23,12 @@ from transformers import AutoModelForImageTextToText, AutoProcessor
 
 
 def parse_layers(layers_text: str, num_layers: int) -> list[int]:
+    """
+    与 HF output_hidden_states 对齐（见 modeling_qwen3_5 + output_capturing）：
+      - 0: patch_embed + 位置编码之后、进入第 1 个 VisionBlock 之前
+      - 1..num_layers: 第 k 个 VisionBlock 的输出（k 从 1 计）
+    num_layers = len(hidden_states) - 1，即 ViT block 数；last == num_layers。
+    """
     tokens = [t.strip().lower() for t in layers_text.split(",") if t.strip()]
     if not tokens:
         raise ValueError("--layers cannot be empty")
@@ -34,10 +41,10 @@ def parse_layers(layers_text: str, num_layers: int) -> list[int]:
         if not token.isdigit():
             raise ValueError(f"Invalid layer token: {token}")
         layer_idx = int(token)
-        if layer_idx < 1:
-            raise ValueError(f"Layer must be >=1, got {layer_idx}")
+        if layer_idx < 0:
+            raise ValueError(f"Layer must be >=0, got {layer_idx}")
         if layer_idx > num_layers:
-            print(f"Warning: skipping layer {layer_idx}; model has {num_layers} layers")
+            print(f"Warning: skipping layer {layer_idx}; valid indices are 0..{num_layers}")
             continue
         layers.append(layer_idx)
     layers = sorted(set(layers))
@@ -47,11 +54,28 @@ def parse_layers(layers_text: str, num_layers: int) -> list[int]:
 
 
 def select_tokens(feat: torch.Tensor, match: str) -> torch.Tensor:
+    """
+    Qwen3.5 ViT 输出为 (seq_len, hidden_dim)，无 batch 维；与部分 CLIP 式 (B, 1+N, D) 不同。
+    --match cls/patch 仅适用于带 CLS 的编码器；此处对 2D 特征做「首 token / 其余 token」切片以便调试。
+    """
+    if feat.ndim == 2:
+        if match == "cls":
+            return feat[:1, :]
+        if match == "patch":
+            return feat[1:, :]
+        return feat
     if match == "cls":
         return feat[:, :1, :]
     if match == "patch":
         return feat[:, 1:, :]
     return feat
+
+
+def feat_flatten_for_cosine(feat: torch.Tensor) -> torch.Tensor:
+    """(S, D) 或 (B, S, D) -> (B, S*D) 用于整体余弦相似度。"""
+    if feat.ndim == 2:
+        return feat.flatten().unsqueeze(0)
+    return feat.flatten(1)
 
 
 def total_variation(x: torch.Tensor) -> torch.Tensor:
@@ -94,33 +118,158 @@ def resolve_visual_encoder(model: Any) -> Any:
     )
 
 
-def preprocess_for_vision(
+def pack_qwen_vl_pixel_values(
+    x: torch.Tensor,
+    *,
+    patch_size: int,
+    temporal_patch_size: int,
+    merge_size: int,
+) -> torch.Tensor:
+    """
+    将 (B, 3, H, W) 的归一化图像张量排成与 HF ``Qwen2VLImageProcessor`` 相同的
+    ``(sum_i patches_i, C*T*patch^2)`` 布局，供 Qwen VL / Qwen3.5 ViT 的 ``patch_embed`` 使用。
+    """
+    if x.ndim != 4:
+        raise ValueError(f"pack_qwen_vl_pixel_values 需要 (B,3,H,W)，当前 {tuple(x.shape)}")
+    b, c, h, w = x.shape
+    if c != 3:
+        raise ValueError("仅支持 3 通道输入")
+    if h % patch_size or w % patch_size:
+        raise ValueError(f"H、W 需被 patch_size={patch_size} 整除，当前 {(h, w)}")
+    gh, gw = h // patch_size, w // patch_size
+    if gh % merge_size or gw % merge_size:
+        raise ValueError(
+            f"patch 格点 (gh,gw)=({gh},{gw}) 需被 merge_size={merge_size} 整除；"
+            "请使用与 processor smart_resize 一致的分辨率。"
+        )
+
+    patches = x.unsqueeze(1)
+    if patches.shape[1] % temporal_patch_size != 0:
+        need = temporal_patch_size - patches.shape[1]
+        rep = patches[:, -1:].repeat(1, need, 1, 1, 1)
+        patches = torch.cat([patches, rep], dim=1)
+
+    batch_size = b
+    grid_t = patches.shape[1] // temporal_patch_size
+    patches = patches.reshape(
+        batch_size,
+        grid_t,
+        temporal_patch_size,
+        c,
+        gh // merge_size,
+        merge_size,
+        patch_size,
+        gw // merge_size,
+        merge_size,
+        patch_size,
+    )
+    patches = patches.permute(0, 1, 4, 7, 5, 8, 3, 2, 6, 9)
+    flat = patches.reshape(
+        batch_size,
+        grid_t * gh * gw,
+        c * temporal_patch_size * patch_size * patch_size,
+    )
+    return flat.reshape(-1, c * temporal_patch_size * patch_size * patch_size)
+
+
+def preprocess_qwen_vl_for_vit(
     x01: torch.Tensor,
     image_processor: Any,
     size_hw: tuple[int, int],
 ) -> torch.Tensor:
     """
-    Minimal differentiable preprocessing aligned with processor mean/std.
-    x01 is in [0,1], shape (B,3,H,W).
+    x01 为 [0,1]、形状 (B,3,*,*)：双线性到 processor 空间尺寸，CLIP 式 mean/std，
+    再打包为 ViT 所需的 ``(num_patches, dim)``（不可再使用 (B,3,H,W) 直接喂 ViT）。
     """
     h, w = size_hw
     x = F.interpolate(x01, size=(h, w), mode="bilinear", align_corners=False)
-
     mean = torch.tensor(image_processor.image_mean, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
     std = torch.tensor(image_processor.image_std, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
     x = (x - mean) / std
-    return x
+    ps = int(getattr(image_processor, "patch_size", 14))
+    ts = int(getattr(image_processor, "temporal_patch_size", 2))
+    ms = int(getattr(image_processor, "merge_size", 2))
+    return pack_qwen_vl_pixel_values(x, patch_size=ps, temporal_patch_size=ts, merge_size=ms)
+
+
+def spatial_hw_for_qwen_vl_pixels(
+    image_processor: Any,
+    image_grid_thw: torch.Tensor,
+    *,
+    image_index: int = 0,
+) -> tuple[int, int]:
+    """
+    Qwen2VL / Qwen3VL（及 Qwen3.5-4B 等）的 image_processor 返回的 pixel_values 为
+    ``(num_patches, patch_dim)`` 的 patch 序列，不是 ``(B, 3, H, W)``。
+    与 processor 一致的空间尺寸 = 空间方向 patch 格点数 × patch_size
+    （对应 HF 内部 smart_resize 后的 ``grid_h, grid_w``）。
+    """
+    patch_size = int(getattr(image_processor, "patch_size", 14))
+    gtw = image_grid_thw
+    if gtw.ndim == 1:
+        g = gtw
+    else:
+        g = gtw[image_index]
+    grid_h = int(g[1].item())
+    grid_w = int(g[2].item())
+    return grid_h * patch_size, grid_w * patch_size
+
+
+def call_qwen_vision_encoder(
+    visual_encoder: Any,
+    pixel_values: torch.Tensor,
+    extra_vision_kwargs: dict[str, torch.Tensor] | None = None,
+    *,
+    output_hidden_states: bool = True,
+) -> Any:
+    """
+    Qwen3_5VisionModel.forward 签名为 (hidden_states, grid_thw)，不能使用 pixel_values=。
+    Processor 提供 image_grid_thw，需映射为 grid_thw；其余 tensor 键不要传入 ViT，以免 **kwargs 传入子模块报错。
+    """
+    extra = dict(extra_vision_kwargs or {})
+    grid = extra.pop("image_grid_thw", None)
+    if grid is None:
+        grid = extra.pop("grid_thw", None)
+    if grid is None:
+        raise ValueError(
+            "缺少 image_grid_thw（或 grid_thw）。请使用与官方一致的 processor 输出，或显式传入 grid。"
+        )
+    for drop in (
+        "pixel_values",
+        "pixel_values_videos",
+        "video_grid_thw",
+        "input_ids",
+        "attention_mask",
+    ):
+        extra.pop(drop, None)
+
+    dtype = getattr(visual_encoder, "dtype", None)
+    if dtype is None:
+        dtype = next(visual_encoder.parameters()).dtype
+    pixel_values = pixel_values.to(dtype=dtype)
+
+    return visual_encoder(
+        pixel_values,
+        grid_thw=grid,
+        output_hidden_states=output_hidden_states,
+        return_dict=True,
+        **extra,
+    )
 
 
 def vision_hidden_at_layer(
     visual_encoder: Any,
     pixel_values: torch.Tensor,
-    layer_idx_1based: int,
+    layer_idx: int,
     extra_vision_kwargs: dict[str, torch.Tensor] | None = None,
 ) -> torch.Tensor:
-    kwargs = dict(extra_vision_kwargs or {})
-    out = visual_encoder(pixel_values=pixel_values, output_hidden_states=True, **kwargs)
-    return out.hidden_states[layer_idx_1based]
+    out = call_qwen_vision_encoder(
+        visual_encoder,
+        pixel_values,
+        extra_vision_kwargs,
+        output_hidden_states=True,
+    )
+    return out.hidden_states[layer_idx]
 
 
 def infer_vision_layer_count(
@@ -128,10 +277,14 @@ def infer_vision_layer_count(
     pixel_values: torch.Tensor,
     extra_vision_kwargs: dict[str, torch.Tensor] | None = None,
 ) -> int:
+    """ViT Transformer 层数 N；hidden_states 共 N+1 项（含 stem 的 [0]）。"""
     with torch.no_grad():
-        kwargs = dict(extra_vision_kwargs or {})
-        out = visual_encoder(pixel_values=pixel_values, output_hidden_states=True, **kwargs)
-    # hidden_states[0] is embedding output
+        out = call_qwen_vision_encoder(
+            visual_encoder,
+            pixel_values,
+            extra_vision_kwargs,
+            output_hidden_states=True,
+        )
     return len(out.hidden_states) - 1
 
 
@@ -176,7 +329,7 @@ def invert_single_layer(
         for _ in pbar:
             optimizer.zero_grad()
             x01 = torch.sigmoid(logits)
-            px = preprocess_for_vision(x01, image_processor=image_processor, size_hw=size_hw)
+            px = preprocess_qwen_vl_for_vit(x01, image_processor=image_processor, size_hw=size_hw)
             pred_feat = vision_hidden_at_layer(
                 visual_encoder,
                 px,
@@ -186,7 +339,9 @@ def invert_single_layer(
             pred = select_tokens(pred_feat, match)
 
             feat_mse = F.mse_loss(pred, target)
-            feat_cos = 1.0 - F.cosine_similarity(pred.flatten(1), target.flatten(1), dim=1).mean()
+            feat_cos = 1.0 - F.cosine_similarity(
+                feat_flatten_for_cosine(pred), feat_flatten_for_cosine(target), dim=1
+            ).mean()
             tv = total_variation(x01)
             l2 = (x01 - 0.5).pow(2).mean()
 
@@ -217,9 +372,13 @@ def save_image(x01: torch.Tensor, path: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-name", default="Qwen/Qwen3.5-VL-3B-Instruct")
-    parser.add_argument("--image", required=True, help="Input image path")
-    parser.add_argument("--layers", default="1,4,8,last", help="Vision layers, e.g. 1,4,8,last")
+    parser.add_argument("--model-name", default="Qwen/Qwen3.5-4B")
+    parser.add_argument("--image", default="/root/autodl-tmp/WechatIMG26.jpg", help="Input image path")
+    parser.add_argument(
+        "--layers",
+        default="1,4,8,last",
+        help="ViT hidden_states 索引: 0=stem, 1..N=各 VisionBlock 后, last=N（与 HF output_hidden_states 一致）",
+    )
     parser.add_argument("--steps", type=int, default=1200)
     parser.add_argument("--lr", type=float, default=0.03)
     parser.add_argument("--feat-weight", type=float, default=1.0)
@@ -239,10 +398,11 @@ def main() -> None:
 
     print(f"Loading model and processor: {args.model_name}")
     processor = AutoProcessor.from_pretrained(args.model_name, trust_remote_code=True)
+    load_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
     model = AutoModelForImageTextToText.from_pretrained(
         args.model_name,
         trust_remote_code=True,
-        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+        dtype=load_dtype,
     ).to(device)
     model.eval()
     for p in model.parameters():
@@ -250,7 +410,9 @@ def main() -> None:
 
     visual_encoder = resolve_visual_encoder(model)
     image_processor = processor.image_processor
-
+    # print(visual_encoder)
+    # print(image_processor)
+    # exit()
     raw = Image.open(args.image).convert("RGB")
     proc = image_processor(images=raw, return_tensors="pt")
     pixel_values = proc["pixel_values"].to(device)
@@ -258,9 +420,14 @@ def main() -> None:
         k: v.to(device) for k, v in proc.items() if k != "pixel_values" and torch.is_tensor(v)
     }
 
-    # Determine optimization spatial size from processor output
-    _, _, h, w = pixel_values.shape
-    size_hw = (h, w)
+    if "image_grid_thw" not in extra_vision_kwargs:
+        raise ValueError("processor 输出中缺少 image_grid_thw，无法推断空间尺寸或调用 ViT。")
+    # pixel_values: (num_patches, dim)，不能解包成 (B,C,H,W)
+    size_hw = spatial_hw_for_qwen_vl_pixels(
+        image_processor,
+        extra_vision_kwargs["image_grid_thw"],
+        image_index=0,
+    )
 
     num_layers = infer_vision_layer_count(
         visual_encoder,
