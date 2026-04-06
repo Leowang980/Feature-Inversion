@@ -544,6 +544,8 @@ def main() -> None:
         p.requires_grad = False
 
     visual_encoder = resolve_visual_encoder(model)
+    print(visual_encoder)
+    exit()
     image_processor = processor.image_processor
     raw = Image.open(args.image).convert("RGB")
     proc = image_processor(images=raw, return_tensors="pt")
