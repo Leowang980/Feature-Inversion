@@ -6,6 +6,7 @@ Workflow:
 2) extract target visual hidden states at selected indices in output_hidden_states
    （与 HF Qwen3_VL / Qwen3_5 ViT 的 capture_outputs 约定一致：0=stem，1..N=各 block 后）
 3) optimize an image in [0,1] so its visual features match target features
+   （优化流程对齐 `optimization.py`：init_image + 多 restart 取最优；默认不从原图 warm-start）
 """
 from __future__ import annotations
 
@@ -14,10 +15,10 @@ import json
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
+from torchvision.transforms import functional as TF
 from tqdm import tqdm
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
@@ -71,13 +72,6 @@ def select_tokens(feat: torch.Tensor, match: str) -> torch.Tensor:
     return feat
 
 
-def feat_flatten_for_cosine(feat: torch.Tensor) -> torch.Tensor:
-    """(S, D) 或 (B, S, D) -> (B, S*D) 用于整体余弦相似度。"""
-    if feat.ndim == 2:
-        return feat.flatten().unsqueeze(0)
-    return feat.flatten(1)
-
-
 def total_variation(x: torch.Tensor) -> torch.Tensor:
     dh = (x[:, :, 1:, :] - x[:, :, :-1, :]).abs().mean()
     dw = (x[:, :, :, 1:] - x[:, :, :, :-1]).abs().mean()
@@ -88,6 +82,18 @@ def to_logits(x01: torch.Tensor) -> torch.Tensor:
     eps = 1e-4
     x = x01.clamp(eps, 1 - eps)
     return torch.log(x) - torch.log1p(-x)
+
+
+def init_image(shape: tuple[int, ...], device: torch.device, init: str = "gray") -> torch.Tensor:
+    """与 `optimization.init_image` 一致：在 [0,1] 空间初始化 (1,3,H,W)。"""
+    if init == "noise":
+        x0 = torch.rand(shape, device=device)
+    elif init == "zeros":
+        x0 = torch.zeros(shape, device=device)
+    else:
+        x0 = torch.full(shape, 0.5, device=device)
+        x0 = (x0 + 0.03 * torch.randn(shape, device=device)).clamp(0, 1)
+    return x0
 
 
 def resolve_visual_encoder(model: Any) -> Any:
@@ -288,13 +294,13 @@ def infer_vision_layer_count(
     return len(out.hidden_states) - 1
 
 
-def invert_single_layer(
+def _single_restart_qwen_vision(
     visual_encoder: Any,
     image_processor: Any,
     target_feat: torch.Tensor,
     layer_idx: int,
-    init_x01: torch.Tensor,
     size_hw: tuple[int, int],
+    device: torch.device,
     steps: int,
     lr: float,
     feat_weight: float,
@@ -302,62 +308,118 @@ def invert_single_layer(
     tv_weight: float,
     l2_weight: float,
     match: str,
-    restarts: int,
+    init: str,
     extra_vision_kwargs: dict[str, torch.Tensor] | None,
 ) -> tuple[torch.Tensor, float]:
-    device = target_feat.device
-    target = select_tokens(target_feat, match).detach()
+    """
+    单次 restart，与 `optimization._single_restart` 对齐：AdamW + CosineAnnealingLR、
+    MSE+cosine+TV+L2、grad clip、记录本 run 最优 x。
+    """
+    h, w = size_hw
+    x0 = init_image((1, 3, h, w), device=device, init=init)
+    logits = to_logits(x0).requires_grad_(True)
+
+    optimizer = torch.optim.AdamW([logits], lr=lr, betas=(0.9, 0.99))
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=steps,
+        eta_min=lr * 0.05,
+    )
 
     best_loss = float("inf")
     best_x = None
+    target = select_tokens(target_feat, match).detach()
 
-    for r in range(restarts):
-        if r == 0:
-            x0 = init_x01.clone()
-        else:
-            x0 = (init_x01 + 0.03 * torch.randn_like(init_x01)).clamp(0, 1)
-        logits = to_logits(x0).requires_grad_(True)
+    pbar = tqdm(range(steps), desc=f"Vision layer {layer_idx} inversion", leave=False)
+    for _ in pbar:
+        optimizer.zero_grad()
+        x01 = torch.sigmoid(logits)
+        px = preprocess_qwen_vl_for_vit(x01, image_processor=image_processor, size_hw=size_hw)
+        pred_feat = vision_hidden_at_layer(
+            visual_encoder,
+            px,
+            layer_idx,
+            extra_vision_kwargs=extra_vision_kwargs,
+        )
+        pred = select_tokens(pred_feat, match)
 
-        optimizer = torch.optim.AdamW([logits], lr=lr, betas=(0.9, 0.99))
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=steps,
-            eta_min=lr * 0.05,
+        feat_mse = F.mse_loss(pred, target)
+        pred_b = pred.unsqueeze(0) if pred.ndim == 2 else pred
+        target_b = target.unsqueeze(0) if target.ndim == 2 else target
+        feat_cos = 1.0 - F.cosine_similarity(pred_b.flatten(1), target_b.flatten(1), dim=1).mean()
+        tv_loss = total_variation(x01)
+        l2_loss = (x01 - 0.5).pow(2).mean()
+
+        loss = (
+            feat_weight * feat_mse
+            + cos_weight * feat_cos
+            + tv_weight * tv_loss
+            + l2_weight * l2_loss
+        )
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_([logits], 1.0)
+        optimizer.step()
+        scheduler.step()
+
+        cur_loss = loss.item()
+        if cur_loss < best_loss:
+            best_loss = cur_loss
+            best_x = x01.detach().clone()
+
+        pbar.set_postfix(
+            loss=f"{cur_loss:.4f}",
+            mse=f"{feat_mse.item():.4f}",
+            cos=f"{feat_cos.item():.4f}",
         )
 
-        pbar = tqdm(range(steps), desc=f"Vision layer {layer_idx} restart {r + 1}/{restarts}", leave=False)
-        for _ in pbar:
-            optimizer.zero_grad()
-            x01 = torch.sigmoid(logits)
-            px = preprocess_qwen_vl_for_vit(x01, image_processor=image_processor, size_hw=size_hw)
-            pred_feat = vision_hidden_at_layer(
-                visual_encoder,
-                px,
-                layer_idx,
-                extra_vision_kwargs=extra_vision_kwargs,
-            )
-            pred = select_tokens(pred_feat, match)
+    if best_x is None:
+        raise RuntimeError("Inversion failed.")
+    return best_x, best_loss
 
-            feat_mse = F.mse_loss(pred, target)
-            feat_cos = 1.0 - F.cosine_similarity(
-                feat_flatten_for_cosine(pred), feat_flatten_for_cosine(target), dim=1
-            ).mean()
-            tv = total_variation(x01)
-            l2 = (x01 - 0.5).pow(2).mean()
 
-            loss = feat_weight * feat_mse + cos_weight * feat_cos + tv_weight * tv + l2_weight * l2
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_([logits], 1.0)
-            optimizer.step()
-            scheduler.step()
-
-            cur_loss = float(loss.item())
-            if cur_loss < best_loss:
-                best_loss = cur_loss
-                best_x = x01.detach().clone()
-
-            pbar.set_postfix(loss=f"{cur_loss:.4f}", mse=f"{feat_mse.item():.4f}", cos=f"{feat_cos.item():.4f}")
-
+def invert_single_layer(
+    visual_encoder: Any,
+    image_processor: Any,
+    target_feat: torch.Tensor,
+    layer_idx: int,
+    size_hw: tuple[int, int],
+    device: torch.device,
+    steps: int,
+    lr: float,
+    feat_weight: float,
+    cos_weight: float,
+    tv_weight: float,
+    l2_weight: float,
+    match: str,
+    init: str,
+    restarts: int,
+    extra_vision_kwargs: dict[str, torch.Tensor] | None,
+) -> tuple[torch.Tensor, float]:
+    """多 restart，与 `optimization.feature_inversion` 一致：取 loss 最低的一次结果。"""
+    best_loss = float("inf")
+    best_x = None
+    for r in range(restarts):
+        print(f"  - restart {r + 1}/{restarts}")
+        x_r, loss_r = _single_restart_qwen_vision(
+            visual_encoder=visual_encoder,
+            image_processor=image_processor,
+            target_feat=target_feat,
+            layer_idx=layer_idx,
+            size_hw=size_hw,
+            device=device,
+            steps=steps,
+            lr=lr,
+            feat_weight=feat_weight,
+            cos_weight=cos_weight,
+            tv_weight=tv_weight,
+            l2_weight=l2_weight,
+            match=match,
+            init=init,
+            extra_vision_kwargs=extra_vision_kwargs,
+        )
+        if loss_r < best_loss:
+            best_loss = loss_r
+            best_x = x_r
     if best_x is None:
         raise RuntimeError("Inversion failed.")
     return best_x, best_loss
@@ -373,7 +435,7 @@ def save_image(x01: torch.Tensor, path: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-name", default="Qwen/Qwen3.5-4B")
-    parser.add_argument("--image", default="/root/autodl-tmp/WechatIMG26.jpg", help="Input image path")
+    parser.add_argument("--image", default="/root/autodl-tmp/WechatIMG26.jpg", help="输入图像路径（仅用于抽取 target 特征与保存参考缩略图）")
     parser.add_argument(
         "--layers",
         default="1,4,8,last",
@@ -386,7 +448,13 @@ def main() -> None:
     parser.add_argument("--tv-weight", type=float, default=1e-3)
     parser.add_argument("--l2-weight", type=float, default=1e-6)
     parser.add_argument("--match", choices=["all", "cls", "patch"], default="all")
-    parser.add_argument("--restarts", type=int, default=2)
+    parser.add_argument(
+        "--init",
+        choices=["noise", "gray", "zeros"],
+        default="noise",
+        help="与 optimization.py 相同：每次 restart 的 (1,3,H,W) 初值；默认 noise（均匀随机 [0,1]）",
+    )
+    parser.add_argument("--restarts", type=int, default=3, help="与 optimization.feature_inversion 默认一致")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", default="results/qwen_vision_inversion")
     args = parser.parse_args()
@@ -437,10 +505,9 @@ def main() -> None:
     layers = parse_layers(args.layers, num_layers)
     print(f"Vision layers: {layers} / total={num_layers}")
 
-    # Init image from processor-compatible [0,1] input resolution
-    init_np = np.array(raw, dtype=np.float32) / 255.0
-    init_x01 = torch.from_numpy(init_np).permute(2, 0, 1).unsqueeze(0).to(device)
-    init_x01 = F.interpolate(init_x01, size=size_hw, mode="bilinear", align_corners=False).clamp(0, 1)
+    # 仅保存与 ViT 输入同分辨率的参考图，不参与优化初值
+    ref_x01 = TF.to_tensor(raw).unsqueeze(0).to(device)
+    ref_x01 = F.interpolate(ref_x01, size=size_hw, mode="bilinear", align_corners=False).clamp(0, 1)
 
     with torch.no_grad():
         target_feats = {
@@ -455,7 +522,7 @@ def main() -> None:
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    save_image(init_x01, out_dir / "input_resized.jpg")
+    save_image(ref_x01, out_dir / "reference_resized.jpg")
 
     rows = []
     for layer in layers:
@@ -465,8 +532,8 @@ def main() -> None:
             image_processor=image_processor,
             target_feat=target_feats[layer],
             layer_idx=layer,
-            init_x01=init_x01,
             size_hw=size_hw,
+            device=device,
             steps=args.steps,
             lr=args.lr,
             feat_weight=args.feat_weight,
@@ -474,6 +541,7 @@ def main() -> None:
             tv_weight=args.tv_weight,
             l2_weight=args.l2_weight,
             match=args.match,
+            init=args.init,
             restarts=args.restarts,
             extra_vision_kwargs=extra_vision_kwargs,
         )
@@ -486,6 +554,8 @@ def main() -> None:
         "model_name": args.model_name,
         "image": args.image,
         "layers": layers,
+        "init": args.init,
+        "restarts": args.restarts,
         "results": rows,
     }
     with (out_dir / "summary.json").open("w", encoding="utf-8") as f:
