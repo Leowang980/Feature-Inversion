@@ -4,86 +4,74 @@ prepare_anchors.py — Set up the anchor image library for semantic_inversion.py
 What this script does
 ---------------------
 1. Creates the anchors/ directory (default: semantic_init/anchors/).
-2. Tries to download one representative image per category from Wikimedia Commons
-   (stable, freely-licensed HTTPS URLs).
-3. If a download fails, generates a synthetic fallback image using PIL
-   (characteristic colour + simple gradient pattern).
+2. For each category, generates one image via OpenRouter (OpenAI-compatible chat API
+   + image modality), using prompts tailored to the category. Any failure raises
+   (no silent fallback to synthetic).
+3. With --synthetic-only only: writes PIL synthetic placeholders (no API, no key).
 
 10 default categories
 ---------------------
   animal, building, vehicle, nature, food, sport, person, technology, art, indoor
 
-Replace any image in anchors/ with a real photograph of your choice.
-The filename stem (e.g. "animal") becomes the category label in the output.
+Environment
+-----------
+  OPENROUTER_API_KEY or OPENAI_API_KEY — required for API generation (unless --synthetic-only).
 
 Usage
 -----
-    python prepare_anchors.py                          # creates anchors/ in this folder
-    python prepare_anchors.py --anchors-dir /my/path   # custom path
-    python prepare_anchors.py --synthetic-only          # skip downloads, pure PIL
+    export OPENROUTER_API_KEY=sk-or-...
+    python prepare_anchors.py
+    python prepare_anchors.py --anchors-dir /my/path
+    python prepare_anchors.py --synthetic-only   # no network / no API
 """
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import io
+import os
+import urllib.error
 import urllib.request
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFilter
 
-# ─── Download URLs ────────────────────────────────────────────────────────────
-# Wikimedia Commons 400 px thumbnails (stable permanent URLs, CC-licensed).
-_URLS: dict[str, str] = {
+# ─── Per-category image prompts (OpenRouter / Gemini image preview) ─────────
+_PROMPTS: dict[str, str] = {
     "animal": (
-        "https://upload.wikimedia.org/wikipedia/commons/thumb/2/26/"
-        "YellowLabradorLooking_new.jpg/400px-YellowLabradorLooking_new.jpg"
+        "Photorealistic close-up of a friendly dog in natural daylight, shallow depth of field."
     ),
     "building": (
-        "https://upload.wikimedia.org/wikipedia/commons/thumb/a/a8/"
-        "Tour_Eiffel_Wikimedia_Commons.jpg/400px-Tour_Eiffel_Wikimedia_Commons.jpg"
+        "Photorealistic modern city skyline with glass skyscrapers at golden hour."
     ),
     "vehicle": (
-        "https://upload.wikimedia.org/wikipedia/commons/thumb/1/1b/"
-        "2018_Volkswagen_Golf_Match_1.0_TSI_Front.jpg/"
-        "400px-2018_Volkswagen_Golf_Match_1.0_TSI_Front.jpg"
+        "Photorealistic silver sedan car, three-quarter front view, clean studio-like lighting."
     ),
     "nature": (
-        "https://upload.wikimedia.org/wikipedia/commons/thumb/e/e7/"
-        "Everest_North_Face_toward_Base_Camp_Tibet_Luca_Galuzzi_2006.jpg/"
-        "400px-Everest_North_Face_toward_Base_Camp_Tibet_Luca_Galuzzi_2006.jpg"
+        "Photorealistic mountain landscape at sunset, layered peaks, dramatic sky."
     ),
     "food": (
-        "https://upload.wikimedia.org/wikipedia/commons/thumb/6/6d/"
-        "Good_Food_Display_-_NCI_Visuals_Online.jpg/"
-        "400px-Good_Food_Display_-_NCI_Visuals_Online.jpg"
+        "Photorealistic overhead shot of a colorful healthy meal on a wooden table."
     ),
     "sport": (
-        "https://upload.wikimedia.org/wikipedia/commons/thumb/1/1e/"
-        "Sunrise_over_the_sea.jpg/"
-        "400px-Sunrise_over_the_sea.jpg"
+        "Photorealistic outdoor soccer field with green grass and white lines, sunny day."
     ),
     "person": (
-        "https://upload.wikimedia.org/wikipedia/commons/thumb/e/ec/"
-        "Mona_Lisa%2C_by_Leonardo_da_Vinci%2C_from_C2RMF_retouched.jpg/"
-        "400px-Mona_Lisa%2C_by_Leonardo_da_Vinci%2C_from_C2RMF_retouched.jpg"
+        "Photorealistic portrait of a smiling adult, soft natural window light, neutral background."
     ),
     "technology": (
-        "https://upload.wikimedia.org/wikipedia/commons/thumb/3/3f/"
-        "Bigl%C3%B6tkolben.jpg/400px-Bigl%C3%B6tkolben.jpg"
+        "Photorealistic macro of a circuit board with chips and copper traces, cool lighting."
     ),
     "art": (
-        "https://upload.wikimedia.org/wikipedia/commons/thumb/e/ea/"
-        "Van_Gogh_-_Starry_Night_-_Google_Art_Project.jpg/"
-        "400px-Van_Gogh_-_Starry_Night_-_Google_Art_Project.jpg"
+        "Oil painting style still life with fruit and vase, rich brushstrokes, museum quality."
     ),
     "indoor": (
-        "https://upload.wikimedia.org/wikipedia/commons/thumb/5/50/"
-        "Interior_design_example.jpg/400px-Interior_design_example.jpg"
+        "Photorealistic cozy modern living room interior, warm ambient light, wide angle."
     ),
 }
 
 # ─── Synthetic fallback images ────────────────────────────────────────────────
-# Each entry: (background_RGB, stripe_RGB, description)
 _SYNTHETIC: dict[str, tuple[tuple[int, int, int], tuple[int, int, int], str]] = {
     "animal":     ((180, 120,  60), (220, 170, 100), "warm brown gradient (fur-like)"),
     "building":   ((160, 160, 160), (200, 200, 200), "grey vertical stripes (facade-like)"),
@@ -109,7 +97,6 @@ def _make_synthetic(
     img = Image.new("RGB", (SIZE, SIZE), bg)
     draw = ImageDraw.Draw(img)
 
-    # Horizontal gradient overlay
     for y in range(SIZE):
         t = y / SIZE
         r = int(bg[0] * (1 - t) + stripe[0] * t)
@@ -117,7 +104,6 @@ def _make_synthetic(
         b = int(bg[2] * (1 - t) + stripe[2] * t)
         draw.line([(0, y), (SIZE, y)], fill=(r, g, b))
 
-    # Add a few characteristic shapes
     if category == "building":
         for x in range(0, SIZE, 32):
             draw.rectangle([x + 4, SIZE // 4, x + 20, SIZE - 8], fill=stripe)
@@ -128,7 +114,6 @@ def _make_synthetic(
         for i in range(0, SIZE, 16):
             draw.rectangle([i, i, i + 8, i + 8], outline=stripe)
     elif category == "art":
-        # Concentric circles (Van Gogh-ish swirl feel)
         for r_val in range(10, SIZE // 2, 20):
             draw.ellipse(
                 [SIZE // 2 - r_val, SIZE // 2 - r_val,
@@ -136,50 +121,149 @@ def _make_synthetic(
                 outline=stripe, width=3,
             )
 
-    # Slight blur to remove pixelation
     return img.filter(ImageFilter.GaussianBlur(radius=2))
 
 
-def _download(url: str, timeout: int = 15) -> Image.Image | None:
+def _decode_data_url(data_url: str) -> bytes:
+    """Decode data:image/...;base64,... payload."""
+    comma = data_url.find(",")
+    if comma == -1:
+        raise ValueError("data URL missing comma separator")
+    payload = data_url[comma + 1 :].strip()
+    # URL-safe base64 sometimes uses - _ ; standard library handles padding
     try:
+        return base64.b64decode(payload, validate=False)
+    except binascii.Error as exc:
+        raise ValueError(f"invalid base64 in data URL: {exc}") from exc
+
+
+def _pil_from_openrouter_message(msg: object, *, category: str) -> Image.Image:
+    """Extract first RGB image from assistant message; raises if missing or invalid."""
+    images = getattr(msg, "images", None)
+    if not images:
+        raise RuntimeError(
+            f"{category}: assistant message has no .images (model may not support image output)."
+        )
+
+    last_decode_err: Exception | None = None
+    for image in images:
+        url: str | None = None
+        if isinstance(image, dict):
+            iu = image.get("image_url")
+            if isinstance(iu, dict):
+                url = iu.get("url")
+            elif isinstance(iu, str):
+                url = iu
+        else:
+            iu = getattr(image, "image_url", None)
+            if isinstance(iu, dict):
+                url = iu.get("url")
+            elif hasattr(iu, "url"):
+                url = getattr(iu, "url", None)
+
+        if not url or not isinstance(url, str):
+            continue
+        if url.startswith("data:"):
+            try:
+                raw = _decode_data_url(url)
+                return Image.open(io.BytesIO(raw)).convert("RGB")
+            except Exception as exc:
+                last_decode_err = exc
+                continue
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = resp.read()
-        return Image.open(io.BytesIO(data)).convert("RGB")
-    except Exception as exc:
-        print(f"    download failed: {exc}")
-        return None
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = resp.read()
+            return Image.open(io.BytesIO(data)).convert("RGB")
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(
+                f"{category}: HTTP {exc.code} while fetching image URL."
+            ) from exc
+        except Exception as exc:
+            raise RuntimeError(
+                f"{category}: failed to fetch or decode image URL: {url[:120]!r}…"
+            ) from exc
+
+    if last_decode_err is not None:
+        raise RuntimeError(
+            f"{category}: could not decode any data URL in .images."
+        ) from last_decode_err
+    raise RuntimeError(
+        f"{category}: .images present but no usable image_url url (empty or wrong shape)."
+    )
 
 
-def prepare(anchors_dir: Path, synthetic_only: bool = False) -> None:
+def _generate_via_openrouter(
+    *,
+    category: str,
+    prompt: str,
+    base_url: str,
+    model: str,
+    api_key: str,
+) -> Image.Image:
+    try:
+        from openai import OpenAI
+    except ImportError as exc:
+        raise ImportError(
+            "openai package is required for API anchor generation (pip install openai)."
+        ) from exc
+
+    client = OpenAI(base_url=base_url, api_key=api_key)
+    completion = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        extra_body={"modalities": ["image", "text"]},
+    )
+    msg = completion.choices[0].message
+    return _pil_from_openrouter_message(msg, category=category)
+
+
+def prepare(
+    anchors_dir: Path,
+    *,
+    synthetic_only: bool = False,
+    openrouter_base_url: str,
+    openrouter_model: str,
+) -> None:
     anchors_dir.mkdir(parents=True, exist_ok=True)
     print(f"Anchor directory: {anchors_dir.resolve()}\n")
 
-    for cat in _SYNTHETIC:   # iterate in a fixed order
+    api_key = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    if not synthetic_only:
+        if not api_key:
+            raise RuntimeError(
+                "OPENROUTER_API_KEY or OPENAI_API_KEY must be set for API generation, "
+                "or pass --synthetic-only for local PIL anchors."
+            )
+        api_key_str: str = api_key
+
+    for cat in _SYNTHETIC:
         out_path = anchors_dir / f"{cat}.jpg"
         if out_path.exists():
             print(f"  {cat:12s}  already exists, skipping")
             continue
 
-        img: Image.Image | None = None
-        if not synthetic_only and cat in _URLS:
-            print(f"  {cat:12s}  downloading …")
-            img = _download(_URLS[cat])
-            if img is not None:
-                print(f"    downloaded ({img.size[0]}×{img.size[1]})")
-
-        if img is None:
+        if synthetic_only:
             bg, stripe, desc = _SYNTHETIC[cat]
-            print(f"  {cat:12s}  generating synthetic ({desc})")
+            print(f"  {cat:12s}  synthetic ({desc})")
             img = _make_synthetic(bg, stripe, cat)
+        else:
+            print(f"  {cat:12s}  generating via OpenRouter …")
+            img = _generate_via_openrouter(
+                category=cat,
+                prompt=_PROMPTS[cat],
+                base_url=openrouter_base_url,
+                model=openrouter_model,
+                api_key=api_key_str,
+            )
+            print(f"    got image ({img.size[0]}×{img.size[1]})")
 
         img.save(out_path, quality=92)
         print(f"    saved → {out_path}")
 
     print(f"\nDone. {len(list(anchors_dir.glob('*.jpg')))} anchor images ready.")
     print(
-        "\nTip: replace any .jpg in the anchors/ folder with a real photograph "
-        "for better semantic matching."
+        "\nTip: replace any .jpg in anchors/ with your own photos for stronger semantic matching."
     )
 
 
@@ -193,7 +277,17 @@ def main() -> None:
     )
     parser.add_argument(
         "--synthetic-only", action="store_true",
-        help="Skip downloads; generate synthetic placeholder images only",
+        help="Skip OpenRouter; use PIL synthetic images only",
+    )
+    parser.add_argument(
+        "--openrouter-base-url",
+        default="https://openrouter.ai/api/v1",
+        help="OpenAI-compatible API base URL",
+    )
+    parser.add_argument(
+        "--openrouter-model",
+        default="google/gemini-3.1-flash-image-preview",
+        help="Model id on OpenRouter that supports image output",
     )
     args = parser.parse_args()
 
@@ -201,7 +295,12 @@ def main() -> None:
     if not anchors_dir.is_absolute():
         anchors_dir = Path(__file__).parent / anchors_dir
 
-    prepare(anchors_dir, synthetic_only=args.synthetic_only)
+    prepare(
+        anchors_dir,
+        synthetic_only=args.synthetic_only,
+        openrouter_base_url=args.openrouter_base_url,
+        openrouter_model=args.openrouter_model,
+    )
 
 
 if __name__ == "__main__":

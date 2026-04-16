@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,23 @@ from PIL import Image
 from torchvision.transforms import functional as TF
 from tqdm import tqdm
 from transformers import AutoModelForImageTextToText, AutoProcessor
+
+
+def apply_local_hf_hub_cache(start_dir: Path | None = None) -> None:
+    """
+    If HF_HUB_CACHE is unset and an ancestor of start_dir contains models/hub
+    (typical: workspace_root/models/hub with models--Org--Name/...), set
+    HF_HUB_CACHE so from_pretrained(\"Qwen/Qwen3.5-4B\") loads from disk.
+    """
+    if os.environ.get("HF_HUB_CACHE") or os.environ.get("HUGGINGFACE_HUB_CACHE"):
+        return
+    start_dir = start_dir or Path(__file__).resolve().parent
+    for base in [start_dir, *start_dir.parents]:
+        hub = base / "models" / "hub"
+        if hub.is_dir():
+            os.environ["HF_HUB_CACHE"] = str(hub)
+            print(f"Using local Hugging Face hub cache: {hub}")
+            return
 
 
 def parse_layers(layers_text: str, num_layers: int) -> list[int]:
@@ -525,6 +543,8 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", default="results/qwen_vision_inversion")
     args = parser.parse_args()
+
+    apply_local_hf_hub_cache(Path(__file__).resolve().parent)
 
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)

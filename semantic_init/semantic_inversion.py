@@ -23,15 +23,19 @@ Algorithm
 
 Usage
 -----
+    If the repo (or any ancestor directory) contains models/hub/ with a HF hub
+    cache for Qwen/Qwen3.5-4B, HF_HUB_CACHE is set automatically so weights load
+    from disk.
+
     # First time: set up anchor images
     python prepare_anchors.py --anchors-dir anchors/
 
     # Run semantic inversion (+ comparison)
     python semantic_inversion.py \\
-        --model-name Qwen/Qwen3.5-VL-3B-Instruct \\
+        --model-name Qwen/Qwen3.5-4B \\
         --image /path/to/target.jpg \\
         --anchors-dir anchors/ \\
-        --layers 4,8,16,last \\
+        --layers 1,4,8,16,last \\
         --steps 1500 \\
         --restarts 3 \\
         --compare
@@ -55,7 +59,7 @@ from transformers import AutoModelForImageTextToText, AutoProcessor
 # ── shared helpers from parent directory ─────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from qwen_vision_feature_inversion import (  # noqa: E402
-    call_qwen_vision_encoder,
+    apply_local_hf_hub_cache,
     infer_vision_layer_count,
     parse_layers,
     preprocess_qwen_vl_for_vit,
@@ -146,9 +150,13 @@ class AnchorLibrary:
         print(f"[anchors] encoding {len(self.names)} anchors at layer {layer_idx} …")
         feats: list[torch.Tensor] = []
         for x01 in self.images_x01:
-            px = preprocess_qwen_vl_for_vit(x01, self.image_processor, self.size_hw)
+            px = preprocess_qwen_vl_for_vit(
+                x01, image_processor=self.image_processor, size_hw=self.size_hw
+            )
             feat = vision_hidden_at_layer(
-                self.visual_encoder, px, layer_idx,
+                self.visual_encoder,
+                px,
+                layer_idx,
                 extra_vision_kwargs=self._extra,
                 forward_dtype=torch.float32,
             ).float()
@@ -267,10 +275,14 @@ def _run_single(
     for _ in pbar:
         opt.zero_grad()
         x01 = torch.sigmoid(logits)
-        px = preprocess_qwen_vl_for_vit(x01, image_processor, size_hw)
+        px = preprocess_qwen_vl_for_vit(
+            x01, image_processor=image_processor, size_hw=size_hw
+        )
         pred = select_tokens(
             vision_hidden_at_layer(
-                visual_encoder, px, layer_idx,
+                visual_encoder,
+                px,
+                layer_idx,
                 extra_vision_kwargs=extra_vision_kwargs,
                 forward_dtype=torch.float32,
             ),
@@ -401,14 +413,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Semantic warm-start feature inversion for Qwen VL vision encoder."
     )
-    parser.add_argument("--model-name", default="Qwen/Qwen3.5-VL-3B-Instruct",
-                        help="HuggingFace model ID")
+    parser.add_argument("--model-name", default="Qwen/Qwen3.5-4B")
     parser.add_argument("--image", required=True,
                         help="Path to the target image to invert")
     parser.add_argument("--anchors-dir", default="anchors",
                         help="Directory of anchor images (one per category)")
-    parser.add_argument("--layers", default="4,8,16,last",
-                        help="ViT hidden_states indices: 0=stem, 1..N=after block, last=N")
+    parser.add_argument(
+        "--layers",
+        default="1,4,8,16,last",
+        help="ViT hidden_states index: 0=stem, 1..N=after each VisionBlock, last=N (HF output_hidden_states).",
+    )
     parser.add_argument("--match-layer", default="same",
                         help="Layer used for anchor matching. 'same' = use the inversion layer. "
                              "Or specify a fixed index, e.g. '8'.")
@@ -426,13 +440,15 @@ def main() -> None:
     parser.add_argument("--output-dir", default="results/semantic_inversion")
     args = parser.parse_args()
 
+    apply_local_hf_hub_cache(Path(__file__).resolve().parent)
+
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    # ── load model ────────────────────────────────────────────────────────────
-    print(f"Loading model: {args.model_name}")
+    # ── load model (same pattern as qwen_vision_feature_inversion.main) ───────
+    print(f"Loading model and processor: {args.model_name}")
     processor = AutoProcessor.from_pretrained(args.model_name, trust_remote_code=True)
     load_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
     model = AutoModelForImageTextToText.from_pretrained(
@@ -451,24 +467,30 @@ def main() -> None:
     raw = Image.open(args.image).convert("RGB")
     proc = image_processor(images=raw, return_tensors="pt")
     pixel_values = proc["pixel_values"].to(device)
-    extra_vision_kwargs: dict[str, torch.Tensor] = {
+    extra_vision_kwargs = {
         k: v.to(device) for k, v in proc.items()
         if k != "pixel_values" and torch.is_tensor(v)
     }
     if "image_grid_thw" not in extra_vision_kwargs:
-        raise ValueError("Processor output is missing image_grid_thw.")
+        raise ValueError(
+            "Processor output is missing image_grid_thw; cannot infer spatial size or call the ViT."
+        )
 
     size_hw = spatial_hw_for_qwen_vl_pixels(
-        image_processor, extra_vision_kwargs["image_grid_thw"], image_index=0
+        image_processor,
+        extra_vision_kwargs["image_grid_thw"],
+        image_index=0,
     )
     print(f"Target spatial resolution: {size_hw}")
 
     # ── layer setup ───────────────────────────────────────────────────────────
     num_layers = infer_vision_layer_count(
-        visual_encoder, pixel_values, extra_vision_kwargs=extra_vision_kwargs
+        visual_encoder,
+        pixel_values,
+        extra_vision_kwargs=extra_vision_kwargs,
     )
     layers = parse_layers(args.layers, num_layers)
-    print(f"Inversion layers: {layers}  (total ViT blocks: {num_layers})")
+    print(f"Vision layers: {layers} / total={num_layers}")
 
     # ── anchor library ────────────────────────────────────────────────────────
     anchors_dir = Path(args.anchors_dir)
@@ -487,7 +509,9 @@ def main() -> None:
     with torch.no_grad():
         target_feats = {
             layer: vision_hidden_at_layer(
-                visual_encoder, pixel_values, layer,
+                visual_encoder,
+                pixel_values,
+                layer,
                 extra_vision_kwargs=extra_vision_kwargs,
             )
             for layer in layers
