@@ -93,7 +93,7 @@ def _make_synthetic(
     stripe: tuple[int, int, int],
     category: str,
 ) -> Image.Image:
-    """Generate a simple 256×256 synthetic image with gradient + pattern."""
+    """Generate a simple 256x256 synthetic image with gradient + pattern."""
     img = Image.new("RGB", (SIZE, SIZE), bg)
     draw = ImageDraw.Draw(img)
 
@@ -181,7 +181,7 @@ def _pil_from_openrouter_message(msg: object, *, category: str) -> Image.Image:
             ) from exc
         except Exception as exc:
             raise RuntimeError(
-                f"{category}: failed to fetch or decode image URL: {url[:120]!r}…"
+                f"{category}: failed to fetch or decode image URL: {url[:120]!r}..."
             ) from exc
 
     if last_decode_err is not None:
@@ -248,7 +248,7 @@ def prepare(
             print(f"  {cat:12s}  synthetic ({desc})")
             img = _make_synthetic(bg, stripe, cat)
         else:
-            print(f"  {cat:12s}  generating via OpenRouter …")
+            print(f"  {cat:12s}  generating via OpenRouter ...")
             img = _generate_via_openrouter(
                 category=cat,
                 prompt=_PROMPTS[cat],
@@ -256,7 +256,7 @@ def prepare(
                 model=openrouter_model,
                 api_key=api_key_str,
             )
-            print(f"    got image ({img.size[0]}×{img.size[1]})")
+            print(f"    got image ({img.size[0]}x{img.size[1]})")
 
         img.save(out_path, quality=92)
         print(f"    saved → {out_path}")

@@ -25,6 +25,11 @@ from tqdm import tqdm
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
 
+def hf_hub_local_files_only() -> bool:
+    """Respect HF_HUB_OFFLINE so from_pretrained skips network (needs local cache)."""
+    return os.environ.get("HF_HUB_OFFLINE", "").strip().lower() in ("1", "true", "yes")
+
+
 def apply_local_hf_hub_cache(start_dir: Path | None = None) -> None:
     """
     If HF_HUB_CACHE is unset and an ancestor of start_dir contains models/hub
@@ -552,12 +557,16 @@ def main() -> None:
     print(f"Device: {device}")
 
     print(f"Loading model and processor: {args.model_name}")
-    processor = AutoProcessor.from_pretrained(args.model_name, trust_remote_code=True)
+    _local = hf_hub_local_files_only()
+    processor = AutoProcessor.from_pretrained(
+        args.model_name, trust_remote_code=True, local_files_only=_local
+    )
     load_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
     model = AutoModelForImageTextToText.from_pretrained(
         args.model_name,
         trust_remote_code=True,
         dtype=load_dtype,
+        local_files_only=_local,
     ).to(device)
     model.eval()
     for p in model.parameters():
