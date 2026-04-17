@@ -14,8 +14,9 @@
 # Optional overrides:
 #   SEMANTIC_STEPS=50 SEMANTIC_LAYERS=1 SEMANTIC_RESTARTS=1 \\
 #     bash run_semantic.sh /path/to/target.jpg
-#   SEMANTIC_METHOD=best|mixup|knn-mixup  (default: knn-mixup) — change this alone to switch experiments
+#   SEMANTIC_METHOD=gray|best|mixup|knn-mixup|knn-weighted-mixup  (default: knn-mixup)
 #   SEMANTIC_KNN_K=5 SEMANTIC_KNN_SIM=neg_l2_mean
+#   SEMANTIC_METHOD=knn-weighted-mixup SEMANTIC_KNN_WEIGHT_TAU=0.05
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -43,6 +44,7 @@ SEMANTIC_RESTARTS="${SEMANTIC_RESTARTS:-3}"
 SEMANTIC_METHOD="${SEMANTIC_METHOD:-knn-mixup}"
 SEMANTIC_KNN_K="${SEMANTIC_KNN_K:-3}"
 SEMANTIC_KNN_SIM="${SEMANTIC_KNN_SIM:-cosine_mean}"
+SEMANTIC_KNN_WEIGHT_TAU="${SEMANTIC_KNN_WEIGHT_TAU:-0.1}"
 EXTRA_COMPARE=()
 if [[ "${SEMANTIC_COMPARE:-0}" == "1" ]]; then
   EXTRA_COMPARE=(--compare)
@@ -74,7 +76,8 @@ python semantic_inversion.py \
     --match       all \
     --method      "${SEMANTIC_METHOD}" \
     --knn-k       "${SEMANTIC_KNN_K}" \
-    --knn-sim     "${SEMANTIC_KNN_SIM}" \
+    --knn-sim        "${SEMANTIC_KNN_SIM}" \
+    --knn-weight-tau "${SEMANTIC_KNN_WEIGHT_TAU}" \
     "${EXTRA_COMPARE[@]}" \
     "${OUTPUT_ARGS[@]}"
 

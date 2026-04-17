@@ -18,11 +18,12 @@ Algorithm
 2. For each target layer, encode all anchors at that layer and select the one
    with the highest cosine similarity to the target features (mean-pooled over
    the token dimension).
-3. Warm-start: --method best | mixup | knn-mixup (switch only this between runs).
+3. Warm-start: --method gray | best | mixup | knn-mixup | knn-weighted-mixup (single switch).
+   ``gray`` = no anchors, gray-init inversion only (the minimal baseline).
 4. Optionally also run a gray-init baseline (--compare) to measure the gain.
 
-TODO (not implemented yet): distance-weighted mixup; softmax weights; multiple
-images per category in anchors/.
+Optional anchors layout: flat `*.jpg` and/or one subfolder per coarse category
+with multiple images inside (`animal/a.jpg`, `animal/b.jpg`). See METHODS.md.
 
 Usage
 -----
@@ -101,15 +102,29 @@ def _experiment_description(
             f"score layer={args.match_layer}; post-mix Gaussian blur "
             f"kernel={args.mixup_blur_kernel}, sigma={args.mixup_blur_sigma}."
         )
+    elif init == "knn-weighted-mixup":
+        init_txt = (
+            f"KNN-weighted-mixup: k={args.knn_k}, sim={args.knn_sim}, "
+            f"softmax(score/tau) pixel weights tau={args.knn_weight_tau} (0=uniform), "
+            f"score layer={args.match_layer}; blur kernel={args.mixup_blur_kernel}, "
+            f"sigma={args.mixup_blur_sigma}."
+        )
     elif init == "mixup":
         init_txt = (
             f"Full-anchor pixel mean + blur kernel={args.mixup_blur_kernel}, "
             f"sigma={args.mixup_blur_sigma}."
         )
-    else:
+    elif init == "gray":
+        init_txt = (
+            "gray: no anchor warm-start; multi-restart gray-noise init only "
+            "(minimal baseline, same as invert_gray)."
+        )
+    elif init == "best":
         init_txt = (
             f"best: per-layer cosine_mean top-1 anchor at match-layer={args.match_layer}."
         )
+    else:
+        init_txt = f"method={init}"
     return (
         f"[{run_id}] Qwen3.5-VL ViT feature inversion; see output_dir field. "
         f"model={args.model_name}; layers={layers}; steps={args.steps}; "
@@ -152,18 +167,45 @@ def _cosine_mean_pool_features(a: torch.Tensor, b: torch.Tensor, *, match: str) 
 # Anchor Library
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _iter_anchor_image_paths(anchors_dir: Path) -> list[tuple[Path, str]]:
+    """
+    Collect (path, display_id) for all anchor images.
+
+    - Top-level image files: display_id = stem (e.g. ``animal``).
+    - Subdirectory (e.g. ``animal/``): every direct child image file uses
+      display_id ``<subdir>/<stem>`` so one class can have many images.
+    """
+    out: list[tuple[Path, str]] = []
+    exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+    if not anchors_dir.is_dir():
+        return out
+    for p in sorted(anchors_dir.iterdir(), key=lambda x: x.name.lower()):
+        if p.name.startswith("."):
+            continue
+        if p.is_dir():
+            for q in sorted(p.iterdir(), key=lambda x: x.name.lower()):
+                if q.is_file() and q.suffix.lower() in exts:
+                    out.append((q, f"{p.name}/{q.stem}"))
+        elif p.is_file() and p.suffix.lower() in exts:
+            out.append((p, p.stem))
+    return out
+
+
 class AnchorLibrary:
     """
-    Manages a small collection of anchor images (one per semantic category).
+    Manages a collection of anchor images (flat files and/or per-category subdirs).
 
-    Directory layout:
+    Directory layout examples:
         anchors/
           animal.jpg
           building.jpg
+        anchors/
+          animal/
+            a.jpg
+            b.jpg
           vehicle.jpg
-          ...
 
-    The filename stem (e.g. "animal") is the category label.
+    Each entry has a display ``name`` (stem or ``folder/stem``) used in logs / KNN.
     All anchors are bilinearly resized to the *same* spatial resolution as the
     target image (target_size_hw) so their feature tensors are directly
     comparable. We reuse the target's image_grid_thw so positional encodings
@@ -171,8 +213,6 @@ class AnchorLibrary:
 
     Features are computed lazily per-layer and cached in memory.
     """
-
-    _EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 
     def __init__(
         self,
@@ -195,27 +235,25 @@ class AnchorLibrary:
         self.images_x01: list[torch.Tensor] = []   # each: (1, 3, H, W) in [0,1]
         self._feat_cache: dict[int, list[torch.Tensor]] = {}
 
-        for p in sorted(anchors_dir.iterdir()):
-            if p.suffix.lower() not in self._EXTS:
-                continue
+        for p, display_name in _iter_anchor_image_paths(anchors_dir):
             try:
                 img = Image.open(p).convert("RGB")
-                x01 = TF.to_tensor(img).unsqueeze(0)          # (1,3,H_raw,W_raw)
+                x01 = TF.to_tensor(img).unsqueeze(0)
                 x01 = F.interpolate(
                     x01, size=target_size_hw,
                     mode="bilinear", align_corners=False,
                 ).clamp(0, 1).to(device)
-                self.names.append(p.stem)
+                self.names.append(display_name)
                 self.images_x01.append(x01)
             except Exception as exc:
-                print(f"[anchors] skip {p.name}: {exc}")
+                print(f"[anchors] skip {p}: {exc}")
 
         if not self.names:
             raise RuntimeError(
                 f"No valid anchor images found in {anchors_dir}.\n"
                 "Run:  python prepare_anchors.py --anchors-dir anchors/"
             )
-        print(f"[anchors] loaded {len(self.names)} categories: {self.names}")
+        print(f"[anchors] loaded {len(self.names)} anchor image(s): {self.names}")
 
     @torch.no_grad()
     def mixup_uniform_blurred(
@@ -314,6 +352,56 @@ class AnchorLibrary:
             mixed = TF.gaussian_blur(mixed, kernel_size=[kb, kb], sigma=[sig, sig]).clamp(0, 1)
         label = "+".join(self.names[i] for i in top_idx)
         return mixed, top_pairs, label
+
+    @torch.no_grad()
+    def knn_weighted_mixup_pixel(
+        self,
+        target_feat: torch.Tensor,
+        sim_layer_idx: int,
+        *,
+        match: str,
+        metric: str,
+        k: int,
+        blur_kernel_size: int,
+        blur_sigma: float,
+        weight_temperature: float,
+    ) -> tuple[torch.Tensor, list[tuple[str, float]], str, list[float]]:
+        """
+        Same KNN ranking as ``knn_mixup_pixel``, then a **softmax-weighted** pixel
+        combination of the top-k images (scores / temperature). tau <= 0 falls
+        back to uniform weights. Optional Gaussian blur after mixing.
+
+        Returns (mix_x01, top_pairs, label, softmax_weights aligned with top_pairs).
+        """
+        scores = self.pairwise_similarities(
+            target_feat, sim_layer_idx, match=match, metric=metric
+        )
+        n = len(scores)
+        kk = min(max(1, int(k)), n)
+        order = sorted(range(n), key=lambda i: scores[i], reverse=True)
+        top_idx = order[:kk]
+        top_pairs = [(self.names[i], scores[i]) for i in top_idx]
+        top_scores = [scores[i] for i in top_idx]
+        tau = float(weight_temperature)
+        dev = self.images_x01[top_idx[0]].device
+        if tau <= 0:
+            w = torch.full((kk,), 1.0 / kk, device=dev, dtype=torch.float32)
+        else:
+            tsc = torch.tensor(top_scores, device=dev, dtype=torch.float32)
+            w = torch.softmax(tsc / tau, dim=0)
+        acc = torch.zeros_like(self.images_x01[top_idx[0]])
+        for j, i in enumerate(top_idx):
+            acc = acc + w[j] * self.images_x01[i]
+        mixed = acc.clamp(0, 1)
+        kb = max(3, int(blur_kernel_size))
+        if kb % 2 == 0:
+            kb += 1
+        sig = max(0.0, float(blur_sigma))
+        if sig > 0:
+            mixed = TF.gaussian_blur(mixed, kernel_size=[kb, kb], sigma=[sig, sig]).clamp(0, 1)
+        label = "+".join(self.names[i] for i in top_idx)
+        weights_list = [float(x) for x in w.detach().cpu().tolist()]
+        return mixed, top_pairs, label, weights_list
 
     @torch.no_grad()
     def _compute_layer(self, layer_idx: int) -> None:
@@ -574,6 +662,52 @@ class SemanticLayerInit:
     row_extra: dict[str, Any] = field(default_factory=dict)
 
 
+def baseline_gray_inversion_for_layer(
+    visual_encoder: Any,
+    image_processor: Any,
+    target_feat: torch.Tensor,
+    *,
+    layer: int,
+    size_hw: tuple[int, int],
+    device: torch.device,
+    steps: int,
+    lr: float,
+    feat_weight: float,
+    cos_weight: float,
+    tv_weight: float,
+    l2_weight: float,
+    match: str,
+    restarts: int,
+    extra_vision_kwargs: dict[str, torch.Tensor],
+    out_dir: Path,
+) -> tuple[torch.Tensor, float, Path]:
+    """
+    Minimal baseline: no anchor library, same as ``invert_gray`` (gray + noise
+    init, multi-restart). This is the reference against semantic warm-start methods.
+    """
+    print("\n  [Baseline: gray init — no anchor warm-start]")
+    recon, loss = invert_gray(
+        visual_encoder,
+        image_processor,
+        target_feat,
+        layer,
+        size_hw,
+        device,
+        steps,
+        lr,
+        feat_weight,
+        cos_weight,
+        tv_weight,
+        l2_weight,
+        match,
+        restarts,
+        extra_vision_kwargs,
+    )
+    out_path = out_dir / f"layer{layer}_baseline_gray.jpg"
+    save_image(recon, out_path)
+    return recon, loss, out_path
+
+
 def baseline_mixup_prepare_global(
     anchor_lib: AnchorLibrary,
     out_dir: Path,
@@ -731,6 +865,84 @@ def baseline_knn_mixup_semantic_init_for_layer(
     )
 
 
+def baseline_knn_weighted_mixup_semantic_init_for_layer(
+    anchor_lib: AnchorLibrary,
+    target_feat: torch.Tensor,
+    visual_encoder: Any,
+    image_processor: Any,
+    *,
+    layer: int,
+    match_layer_fixed: int | None,
+    match: str,
+    size_hw: tuple[int, int],
+    out_dir: Path,
+    extra_vision_kwargs: dict[str, torch.Tensor],
+    knn_k: int,
+    knn_sim: str,
+    mixup_blur_kernel: int,
+    mixup_blur_sigma: float,
+    knn_weight_tau: float,
+) -> SemanticLayerInit:
+    """KNN top-k then softmax(score/tau) weighted pixel mix + optional blur."""
+    ml = layer if match_layer_fixed is None else match_layer_fixed
+    anchor_x01, top_pairs, label, knn_weights = anchor_lib.knn_weighted_mixup_pixel(
+        target_feat,
+        ml,
+        match=match,
+        metric=knn_sim,
+        k=knn_k,
+        blur_kernel_size=mixup_blur_kernel,
+        blur_sigma=mixup_blur_sigma,
+        weight_temperature=knn_weight_tau,
+    )
+    anchor_name = f"knnw:{label}"
+    top_str = ", ".join(f"{n}={s:.3f}" for n, s in top_pairs)
+    w_str = ", ".join(f"{w:.3f}" for w in knn_weights)
+    print(
+        f"  -> knn-weighted-mixup (k={knn_k}, sim={knn_sim}, tau={knn_weight_tau}, "
+        f"score_layer={ml}): {top_str} | weights=[{w_str}]"
+    )
+    tau_tag = str(knn_weight_tau).replace(".", "p")
+    save_image(
+        anchor_x01,
+        out_dir / f"layer{layer}_knnw_k{knn_k}_tau{tau_tag}_{knn_sim.replace('_', '-')}.jpg",
+    )
+    with torch.no_grad():
+        px_m = preprocess_qwen_vl_for_vit(
+            anchor_x01,
+            image_processor=image_processor,
+            size_hw=size_hw,
+        )
+        feat_mix = vision_hidden_at_layer(
+            visual_encoder,
+            px_m,
+            layer,
+            extra_vision_kwargs=extra_vision_kwargs,
+            forward_dtype=torch.float32,
+        )
+    anchor_sim = _cosine_mean_pool_features(
+        target_feat, feat_mix, match=match
+    )
+    print(
+        f"    target↔knn-weighted-mixup feat cosine @ inversion layer {layer} = {anchor_sim:.4f}"
+    )
+    row_extra: dict[str, Any] = {
+        "knn_k": knn_k,
+        "knn_sim": knn_sim,
+        "knn_score_layer": ml,
+        "knn_weight_tau": knn_weight_tau,
+        "knn_top": [{"name": n, "score": round(s, 4)} for n, s in top_pairs],
+        "knn_softmax_weights": [round(w, 4) for w in knn_weights],
+    }
+    return SemanticLayerInit(
+        anchor_x01=anchor_x01,
+        anchor_name=anchor_name,
+        anchor_sim=anchor_sim,
+        top_pairs=list(top_pairs),
+        row_extra=row_extra,
+    )
+
+
 def run_semantic_layer_init_from_method(
     method: str,
     *,
@@ -749,6 +961,7 @@ def run_semantic_layer_init_from_method(
     knn_sim: str,
     mixup_blur_kernel: int,
     mixup_blur_sigma: float,
+    knn_weight_tau: float,
 ) -> SemanticLayerInit:
     """
     Single entry: switch on ``method`` only. New experiments = add a new branch
@@ -794,8 +1007,26 @@ def run_semantic_layer_init_from_method(
             mixup_blur_kernel=mixup_blur_kernel,
             mixup_blur_sigma=mixup_blur_sigma,
         )
+    if method == "knn-weighted-mixup":
+        return baseline_knn_weighted_mixup_semantic_init_for_layer(
+            anchor_lib,
+            target_feat,
+            visual_encoder,
+            image_processor,
+            layer=layer,
+            match_layer_fixed=match_layer_fixed,
+            match=match,
+            size_hw=size_hw,
+            out_dir=out_dir,
+            extra_vision_kwargs=extra_vision_kwargs,
+            knn_k=knn_k,
+            knn_sim=knn_sim,
+            mixup_blur_kernel=mixup_blur_kernel,
+            mixup_blur_sigma=mixup_blur_sigma,
+            knn_weight_tau=knn_weight_tau,
+        )
     raise ValueError(
-        f"Unknown method={method!r}. Registered: best, mixup, knn-mixup. "
+        f"Unknown method={method!r}. Registered: gray, best, mixup, knn-mixup, knn-weighted-mixup. "
         "Add a new baseline_* and a branch in run_semantic_layer_init_from_method."
     )
 
@@ -820,20 +1051,23 @@ def main() -> None:
     parser.add_argument("--model-name", default="Qwen/Qwen3.5-4B")
     parser.add_argument("--image", required=True,
                         help="Path to the target image to invert")
-    parser.add_argument("--anchors-dir", default="anchors",
-                        help="Directory of anchor images (one per category)")
+    parser.add_argument(
+        "--anchors-dir",
+        default="anchors",
+        help="Anchor root: top-level images and/or subfolders each holding multiple images.",
+    )
     parser.add_argument(
         "--layers",
         default="1,4,8,16,last",
         help="ViT hidden_states index: 0=stem, 1..N=after each VisionBlock, last=N (HF output_hidden_states).",
     )
     parser.add_argument("--match-layer", default="same",
-                        help="Feature layer for scores: 'same' = inversion layer; fixed int for best/knn-mixup.")
+                        help="Feature layer for scores: 'same' = inversion layer; fixed int for KNN/best.")
     parser.add_argument(
         "--method",
-        choices=["best", "mixup", "knn-mixup"],
+        choices=["gray", "best", "mixup", "knn-mixup", "knn-weighted-mixup"],
         default="knn-mixup",
-        help="Warm-start recipe (only change this between runs). Implemented in baseline_* + dispatch.",
+        help="Warm-start: gray=no anchors (minimal baseline); others use anchors. See METHODS.md.",
     )
     parser.add_argument(
         "--knn-k",
@@ -846,6 +1080,12 @@ def main() -> None:
         choices=["cosine_mean", "neg_l2_mean"],
         default="cosine_mean",
         help="Similarity for KNN ranking: cosine on mean-pooled tokens, or neg L2 on mean pools.",
+    )
+    parser.add_argument(
+        "--knn-weight-tau",
+        type=float,
+        default=0.1,
+        help="Softmax temperature score/tau for knn-weighted-mixup pixel weights; 0 or negative = uniform.",
     )
     parser.add_argument(
         "--mixup-blur-kernel",
@@ -939,18 +1179,20 @@ def main() -> None:
     layers = parse_layers(args.layers, num_layers)
     print(f"Vision layers: {layers} / total={num_layers}")
 
-    # ── anchor library ────────────────────────────────────────────────────────
+    # ── anchor library (not needed for minimal gray baseline) ─────────────────
     anchors_dir = Path(args.anchors_dir)
     if not anchors_dir.is_absolute():
         anchors_dir = script_dir / anchors_dir
-    anchor_lib = AnchorLibrary(
-        anchors_dir=anchors_dir,
-        visual_encoder=visual_encoder,
-        image_processor=image_processor,
-        target_size_hw=size_hw,
-        target_extra_kwargs=extra_vision_kwargs,
-        device=device,
-    )
+    anchor_lib: AnchorLibrary | None = None
+    if args.method != "gray":
+        anchor_lib = AnchorLibrary(
+            anchors_dir=anchors_dir,
+            visual_encoder=visual_encoder,
+            image_processor=image_processor,
+            target_size_hw=size_hw,
+            target_extra_kwargs=extra_vision_kwargs,
+            device=device,
+        )
 
     # ── extract target features ───────────────────────────────────────────────
     with torch.no_grad():
@@ -971,11 +1213,19 @@ def main() -> None:
 
     mixup_x01: torch.Tensor | None = None
     if args.method == "mixup":
+        assert anchor_lib is not None
         mixup_x01 = baseline_mixup_prepare_global(
             anchor_lib,
             out_dir,
             mixup_blur_kernel=args.mixup_blur_kernel,
             mixup_blur_sigma=args.mixup_blur_sigma,
+        )
+
+    compare_effective = bool(args.compare) and args.method != "gray"
+    if args.compare and args.method == "gray":
+        print(
+            "[note] --compare ignored when --method gray "
+            "(this run already is the gray-init baseline)."
         )
 
     # ── layer used for KNN / best anchor scoring (vs inversion layer) ──────────
@@ -993,53 +1243,82 @@ def main() -> None:
         print(f"\n{'=' * 60}")
         print(f"[Inversion] layer = {layer}")
 
-        pack = run_semantic_layer_init_from_method(
-            args.method,
-            layer=layer,
-            anchor_lib=anchor_lib,
-            target_feat=target_feats[layer],
-            visual_encoder=visual_encoder,
-            image_processor=image_processor,
-            size_hw=size_hw,
-            match_layer_fixed=match_layer_fixed,
-            match=args.match,
-            out_dir=out_dir,
-            extra_vision_kwargs=extra_vision_kwargs,
-            mixup_x01=mixup_x01,
-            knn_k=args.knn_k,
-            knn_sim=args.knn_sim,
-            mixup_blur_kernel=args.mixup_blur_kernel,
-            mixup_blur_sigma=args.mixup_blur_sigma,
-        )
-        anchor_x01 = pack.anchor_x01
-        anchor_name = pack.anchor_name
-        anchor_sim = pack.anchor_sim
+        pack_row_extra: dict[str, Any] = {}
 
-        # Semantic warm-start inversion
-        print(f"\n  [Semantic init]")
-        recon_sem, loss_sem = invert_semantic(
-            visual_encoder, image_processor, target_feats[layer], layer,
-            size_hw, device, args.steps, args.lr,
-            args.feat_weight, args.cos_weight, args.tv_weight, args.l2_weight,
-            args.match, args.restarts, anchor_x01, extra_vision_kwargs,
-        )
-        sem_path = out_dir / f"layer{layer}_semantic.jpg"
-        save_image(recon_sem, sem_path)
-        psnr_sem = compute_psnr(recon_sem, ref_x01)
-        print(f"  Semantic  loss={loss_sem:.6f}  PSNR={psnr_sem:.2f} dB")
+        if args.method == "gray":
+            recon_sem, loss_sem, sem_path = baseline_gray_inversion_for_layer(
+                visual_encoder,
+                image_processor,
+                target_feats[layer],
+                layer=layer,
+                size_hw=size_hw,
+                device=device,
+                steps=args.steps,
+                lr=args.lr,
+                feat_weight=args.feat_weight,
+                cos_weight=args.cos_weight,
+                tv_weight=args.tv_weight,
+                l2_weight=args.l2_weight,
+                match=args.match,
+                restarts=args.restarts,
+                extra_vision_kwargs=extra_vision_kwargs,
+                out_dir=out_dir,
+            )
+            anchor_name = "gray"
+            anchor_cosine_out: float | None = None
+            psnr_sem = compute_psnr(recon_sem, ref_x01)
+            print(f"  loss={loss_sem:.6f}  PSNR={psnr_sem:.2f} dB  -> {sem_path}")
+        else:
+            assert anchor_lib is not None
+            pack = run_semantic_layer_init_from_method(
+                args.method,
+                layer=layer,
+                anchor_lib=anchor_lib,
+                target_feat=target_feats[layer],
+                visual_encoder=visual_encoder,
+                image_processor=image_processor,
+                size_hw=size_hw,
+                match_layer_fixed=match_layer_fixed,
+                match=args.match,
+                out_dir=out_dir,
+                extra_vision_kwargs=extra_vision_kwargs,
+                mixup_x01=mixup_x01,
+                knn_k=args.knn_k,
+                knn_sim=args.knn_sim,
+                mixup_blur_kernel=args.mixup_blur_kernel,
+                mixup_blur_sigma=args.mixup_blur_sigma,
+                knn_weight_tau=args.knn_weight_tau,
+            )
+            anchor_x01 = pack.anchor_x01
+            anchor_name = pack.anchor_name
+            anchor_cosine_out = round(pack.anchor_sim, 4)
+            pack_row_extra = dict(pack.row_extra)
+
+            print(f"\n  [Semantic warm-start inversion]")
+            recon_sem, loss_sem = invert_semantic(
+                visual_encoder, image_processor, target_feats[layer], layer,
+                size_hw, device, args.steps, args.lr,
+                args.feat_weight, args.cos_weight, args.tv_weight, args.l2_weight,
+                args.match, args.restarts, anchor_x01, extra_vision_kwargs,
+            )
+            sem_path = out_dir / f"layer{layer}_semantic.jpg"
+            save_image(recon_sem, sem_path)
+            psnr_sem = compute_psnr(recon_sem, ref_x01)
+            print(f"  Semantic  loss={loss_sem:.6f}  PSNR={psnr_sem:.2f} dB")
 
         row: dict = {
             "layer": layer,
             "anchor": anchor_name,
-            "anchor_cosine": round(anchor_sim, 4),
             "semantic_loss": round(loss_sem, 6),
             "semantic_psnr": round(psnr_sem, 3),
             "semantic_output": str(sem_path),
         }
-        if pack.row_extra:
-            row.update(pack.row_extra)
+        if anchor_cosine_out is not None:
+            row["anchor_cosine"] = anchor_cosine_out
+        if pack_row_extra:
+            row.update(pack_row_extra)
 
-        if args.compare:
+        if compare_effective:
             print(f"\n  [Gray init  (baseline)]")
             recon_gray, loss_gray = invert_gray(
                 visual_encoder, image_processor, target_feats[layer], layer,
@@ -1077,7 +1356,8 @@ def main() -> None:
         "layers": layers,
         "restarts": args.restarts,
         "steps": args.steps,
-        "compare": args.compare,
+        "compare": compare_effective,
+        "compare_requested": args.compare,
         "method": args.method,
         "match": args.match,
         "match_layer": args.match_layer,
@@ -1091,18 +1371,26 @@ def main() -> None:
         summary["knn_sim"] = args.knn_sim
         summary["mixup_blur_kernel"] = args.mixup_blur_kernel
         summary["mixup_blur_sigma"] = args.mixup_blur_sigma
+    if args.method == "knn-weighted-mixup":
+        summary["knn_k"] = args.knn_k
+        summary["knn_sim"] = args.knn_sim
+        summary["knn_weight_tau"] = args.knn_weight_tau
+        summary["mixup_blur_kernel"] = args.mixup_blur_kernel
+        summary["mixup_blur_sigma"] = args.mixup_blur_sigma
     summary_path = out_dir / "summary.json"
     with summary_path.open("w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=True)
     print(f"\nSummary saved: {summary_path}")
 
-    if args.compare:
+    if compare_effective:
         print("\n── PSNR comparison table ─────────────────────────────")
         print(f"{'layer':>6}  {'anchor':>12}  {'sim':>6}  {'PSNR_sem':>9}  {'PSNR_gray':>9}  {'gain':>6}")
         for r in rows:
             gain_str = f"{r.get('psnr_gain_db', 0):+.2f}" if "psnr_gain_db" in r else "  n/a"
+            ac = r.get("anchor_cosine")
+            sim_cell = f"{ac:.3f}" if isinstance(ac, (int, float)) else "   n/a"
             print(
-                f"{r['layer']:>6}  {r['anchor']:>12}  {r['anchor_cosine']:>6.3f}  "
+                f"{r['layer']:>6}  {r['anchor']:>12}  {sim_cell:>6}  "
                 f"{r['semantic_psnr']:>9.2f}  {r.get('gray_psnr', float('nan')):>9.2f}  "
                 f"{gain_str:>6}"
             )

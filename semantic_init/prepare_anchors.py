@@ -9,9 +9,12 @@ What this script does
    (no silent fallback to synthetic).
 3. With --synthetic-only only: writes PIL synthetic placeholders (no API, no key).
 
-10 default categories
----------------------
+10 default categories (flat files under anchors/)
+---------------------------------------------------
   animal, building, vehicle, nature, food, sport, person, technology, art, indoor
+
+For more than one image per class, add a subfolder per class (e.g. ``animal/1.jpg``)
+and keep using the same ``semantic_inversion`` ``--anchors-dir``; see METHODS.md.
 
 Environment
 -----------
